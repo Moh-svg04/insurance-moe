@@ -241,12 +241,140 @@ if page == "📊 Dashboard":
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — CLASSIFIER UN DOCUMENT
+# PAGE 2 — CLASSIFIER UN DOCUMENT (traitement réel du fichier)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 elif page == "📄 Classifier un document":
+    import re
+    import unicodedata
+
+    # ── Fonctions d'extraction de texte ───────────────────────────────────────
+
+    def extraire_texte_pdf(fichier_bytes: bytes) -> str:
+        try:
+            import pdfplumber
+            import io as _io
+            with pdfplumber.open(_io.BytesIO(fichier_bytes)) as pdf:
+                pages = [p.extract_text() or "" for p in pdf.pages]
+            return "\n\n".join(pages).strip()
+        except ImportError:
+            return extraire_texte_pdf_fallback(fichier_bytes)
+        except Exception as e:
+            return f"[Erreur lecture PDF : {e}]"
+
+    def extraire_texte_pdf_fallback(fichier_bytes: bytes) -> str:
+        """Extraction basique sans pdfplumber — cherche les chaînes lisibles."""
+        try:
+            raw = fichier_bytes.decode("latin-1", errors="replace")
+            # Garder uniquement les caractères imprimables
+            tokens = re.findall(r'[A-Za-zÀ-ÿ0-9€@.,;:\-/\(\) ]{4,}', raw)
+            return " ".join(tokens[:500])
+        except Exception:
+            return "[Impossible de lire ce PDF sans pdfplumber]"
+
+    def extraire_texte_image(fichier_bytes: bytes) -> str:
+        try:
+            import pytesseract
+            from PIL import Image
+            import io as _io
+            img = Image.open(_io.BytesIO(fichier_bytes))
+            return pytesseract.image_to_string(img, lang="fra").strip()
+        except ImportError:
+            return "[OCR non disponible — installez pytesseract et Pillow]"
+        except Exception as e:
+            return f"[Erreur OCR : {e}]"
+
+    def extraire_texte(uploaded_file) -> str:
+        """Point d'entrée unique — détecte le type et extrait le texte."""
+        ext = uploaded_file.name.lower().split(".")[-1]
+        data = uploaded_file.read()
+        if ext == "pdf":
+            return extraire_texte_pdf(data)
+        elif ext in ("png", "jpg", "jpeg", "tiff", "bmp"):
+            return extraire_texte_image(data)
+        elif ext == "txt":
+            return data.decode("utf-8", errors="replace").strip()
+        else:
+            return data.decode("utf-8", errors="replace").strip()
+
+    # ── Fonctions NLP légères (sans spaCy) ────────────────────────────────────
+
+    PATTERNS = {
+        "Montant (€)":        r'\b\d{1,3}(?:[\s]\d{3})*(?:[.,]\d{1,2})?\s*(?:€|EUR|euros?)\b',
+        "Date":               r'\b(?:\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})\b',
+        "Email":              r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
+        "Téléphone":          r'\b(?:(?:\+33|0033|0)[1-9])(?:[\s.\-]?\d{2}){4}\b',
+        "IBAN":               r'\bFR\d{2}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{2,3}\b',
+        "Immatriculation":    r'\b[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}\b',
+        "Code postal":        r'\b(?:0[1-9]|[1-8]\d|9[0-5])\d{3}\b',
+        "Numéro de contrat":  r'\b(?:N°?|Ref\.?|Contrat)[\s:]*([A-Z0-9\-]{6,20})\b',
+    }
+
+    CLASSES = {
+        "contrat_assurance_auto":       ["automobile", "auto", "véhicule", "immatriculation", "conducteur", "rc auto", "bonus"],
+        "contrat_assurance_vie":        ["assurance vie", "capital décès", "bénéficiaire", "épargne", "décès"],
+        "contrat_assurance_habitation": ["habitation", "multirisque", "mrh", "logement", "locataire", "propriétaire"],
+        "contrat_assurance_sante":      ["santé", "mutuelle", "remboursement", "soins", "hospitalisation"],
+        "formulaire_souscription":      ["souscription", "demande", "adhésion", "formulaire", "candidature"],
+        "declaration_sinistre":         ["sinistre", "accident", "déclaration", "dommage", "incident", "vol"],
+        "piece_identite":               ["carte nationale", "passeport", "identité", "nationalité", "née le"],
+        "releve_bancaire":              ["iban", "rib", "relevé", "bancaire", "solde", "virement", "compte"],
+        "resiliation":                  ["résiliation", "résilier", "mettre fin", "annulation", "échéance"],
+    }
+
+    INTENTIONS = {
+        "souscription":  ["souscrire", "nouveau contrat", "adhérer", "ouvrir"],
+        "résiliation":   ["résilier", "annuler", "mettre fin", "clôturer"],
+        "sinistre":      ["sinistre", "accident", "déclarer", "dommage"],
+        "réclamation":   ["réclamer", "rembourser", "indemniser", "litige"],
+        "information":   ["renseignement", "information", "question", "savoir"],
+    }
+
+    def classifier_texte(texte: str) -> dict:
+        t = texte.lower()
+        scores = {}
+        for cls, mots in CLASSES.items():
+            scores[cls] = sum(t.count(m) for m in mots)
+        total = sum(scores.values()) or 1
+        probas = {k: round(v / total, 3) for k, v in scores.items()}
+        # Normaliser pour avoir une somme à 1
+        s = sum(probas.values()) or 1
+        probas = {k: round(v / s, 3) for k, v in probas.items()}
+        top = max(probas, key=probas.get)
+        return {"classe": top, "confiance": probas[top], "probas": probas}
+
+    def extraire_entites(texte: str) -> dict:
+        entites = {}
+        for nom, pattern in PATTERNS.items():
+            matches = list(set(re.findall(pattern, texte, re.IGNORECASE)))
+            if matches:
+                entites[nom] = matches[:3]
+        return entites
+
+    def detecter_intention(texte: str) -> tuple:
+        t = texte.lower()
+        scores = {k: sum(t.count(m) for m in mots) for k, mots in INTENTIONS.items()}
+        if all(v == 0 for v in scores.values()):
+            return "information", 0.5
+        top = max(scores, key=scores.get)
+        total = sum(scores.values()) or 1
+        return top, round(scores[top] / total, 2)
+
+    def top_mots_cles(texte: str, n: int = 10) -> list:
+        mots = re.findall(r'\b[a-zA-ZÀ-ÿ]{4,}\b', texte.lower())
+        stop = {"pour", "dans", "avec", "cette", "sont", "être", "avoir", "plus",
+                "comme", "leur", "nous", "vous", "tout", "mais", "donc", "votre",
+                "notre", "entre", "selon", "après", "avant", "sous", "bien"}
+        freq = {}
+        for m in mots:
+            if m not in stop:
+                freq[m] = freq.get(m, 0) + 1
+        return sorted(freq.items(), key=lambda x: -x[1])[:n]
+
+    # ── Interface ─────────────────────────────────────────────────────────────
+
     st.title("📄 Classification de document")
-    st.markdown("Uploader un document PDF, image ou texte — le modèle IA l'analyse instantanément.")
+    st.markdown("Uploade un vrai fichier — le texte est extrait et analysé directement dans ton navigateur.")
 
     col_up, col_res = st.columns([1, 1])
 
@@ -255,73 +383,131 @@ elif page == "📄 Classifier un document":
         uploaded = st.file_uploader(
             "Glisser-déposer un fichier",
             type=["pdf", "png", "jpg", "jpeg", "txt"],
-            help="PDF, image ou texte — max 50 MB",
+            help="PDF natif, image (OCR) ou texte brut — max 50 MB",
         )
 
         texte_libre = st.text_area(
             "Ou coller du texte directement",
-            height=180,
-            placeholder="Ex: CONTRAT D'ASSURANCE AUTOMOBILE\nAssuré : Jean Martin\nPrime annuelle : 850 €\n...",
+            height=200,
+            placeholder=(
+                "Ex :\nCONTRAT D'ASSURANCE AUTOMOBILE\n"
+                "Assuré : Jean Martin\n"
+                "Véhicule : AB-123-CD\n"
+                "Prime annuelle : 850 €\n"
+                "Date d'effet : 01/01/2024\n"
+                "Email : jean@email.fr"
+            ),
         )
 
         analyser = st.button("🔍 Analyser", type="primary", use_container_width=True)
 
+        # Aperçu du texte extrait
+        if uploaded and not analyser:
+            with st.expander("👁️ Aperçu texte extrait"):
+                apercu = extraire_texte(uploaded)
+                uploaded.seek(0)
+                st.text(apercu[:800] + ("..." if len(apercu) > 800 else ""))
+
     with col_res:
         st.subheader("Résultats")
 
-        if analyser and (uploaded or texte_libre.strip()):
-            with st.spinner("Analyse en cours..."):
-                time.sleep(1.2)  # Simulation traitement
+        texte_final = ""
 
-            # Résultats simulés
-            classes_probas = {
-                "contrat_assurance_auto": 0.847,
-                "formulaire_souscription": 0.072,
-                "contrat_assurance_vie": 0.041,
-                "declaration_sinistre": 0.023,
-                "piece_identite": 0.017,
-            }
-            top_class = max(classes_probas, key=classes_probas.get)
-            top_conf = classes_probas[top_class]
+        if analyser:
+            # Récupérer le texte
+            if uploaded:
+                with st.spinner("Extraction du texte..."):
+                    texte_final = extraire_texte(uploaded)
+            elif texte_libre.strip():
+                texte_final = texte_libre.strip()
 
-            # Badge résultat
-            color = "#3dd68c" if top_conf > 0.8 else "#f5a623"
+            if not texte_final or len(texte_final) < 10:
+                st.error("❌ Impossible d'extraire du texte. Vérifie que le fichier n'est pas vide ou corrompu.")
+                st.stop()
+
+            t0 = time.time()
+
+            with st.spinner("Classification NLP en cours..."):
+                resultat     = classifier_texte(texte_final)
+                entites      = extraire_entites(texte_final)
+                intention, conf_intent = detecter_intention(texte_final)
+                mots_cles    = top_mots_cles(texte_final)
+
+            temps_ms = round((time.time() - t0) * 1000)
+
+            # ── Badge classe ──────────────────────────────────────────────────
+            top_class = resultat["classe"]
+            top_conf  = resultat["confiance"]
+            color = "#3dd68c" if top_conf > 0.5 else "#f5a623" if top_conf > 0.25 else "#8891a8"
+
             st.markdown(f"""
-            <div style="background:{color}22;border:1px solid {color};border-radius:10px;padding:16px;margin-bottom:16px">
-                <div style="font-size:0.8rem;opacity:0.7">Classe détectée</div>
-                <div style="font-size:1.4rem;font-weight:700">{top_class.replace("_", " ").title()}</div>
-                <div style="font-size:1rem">Confiance : <b>{top_conf:.1%}</b></div>
+            <div style="background:{color}22;border:1px solid {color};
+            border-radius:10px;padding:16px;margin-bottom:16px">
+                <div style="font-size:0.75rem;opacity:0.6;margin-bottom:4px">Classe détectée</div>
+                <div style="font-size:1.35rem;font-weight:700">
+                    {top_class.replace("_", " ").title()}
+                </div>
+                <div style="font-size:0.95rem;margin-top:4px">
+                    Confiance : <b style="color:{color}">{top_conf:.1%}</b>
+                </div>
             </div>
             """, unsafe_allow_html=True)
 
-            # Barres de probabilité
-            st.markdown("**Distribution des probabilités**")
-            for cls, prob in sorted(classes_probas.items(), key=lambda x: -x[1]):
-                st.progress(prob, text=f"{cls.replace('_', ' ')}  —  {prob:.1%}")
+            # ── Probabilités ──────────────────────────────────────────────────
+            with st.expander("📊 Distribution des probabilités", expanded=True):
+                probas_triees = sorted(
+                    resultat["probas"].items(), key=lambda x: -x[1]
+                )
+                for cls, prob in probas_triees:
+                    if prob > 0:
+                        label = f"{cls.replace('_', ' ')}  —  {prob:.1%}"
+                        st.progress(min(prob, 1.0), text=label)
 
+            # ── Entités extraites ──────────────────────────────────────────────
+            st.markdown("**🏷️ Entités extraites**")
+            if entites:
+                cols = st.columns(2)
+                for i, (nom, vals) in enumerate(entites.items()):
+                    with cols[i % 2]:
+                        st.markdown(f"**{nom}**")
+                        for v in vals:
+                            st.code(v, language=None)
+            else:
+                st.info("Aucune entité structurée détectée (montant, date, IBAN…)")
+
+            # ── Mots-clés ─────────────────────────────────────────────────────
+            with st.expander("🔑 Mots-clés TF-IDF (top 10)"):
+                mots_df = pd.DataFrame(mots_cles, columns=["mot", "fréquence"])
+                fig_mots = px.bar(
+                    mots_df.sort_values("fréquence"),
+                    x="fréquence", y="mot", orientation="h",
+                    color="fréquence",
+                    color_continuous_scale=["#4f8ef7", "#9b8bff"],
+                )
+                fig_mots.update_layout(
+                    height=280, margin=dict(t=5, b=5, l=5, r=5),
+                    coloraxis_showscale=False,
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_mots, use_container_width=True)
+
+            # ── Résumé ────────────────────────────────────────────────────────
             st.markdown("---")
+            col_i, col_t = st.columns(2)
+            with col_i:
+                st.markdown(f"**Intention** : `{intention}` ({conf_intent:.0%})")
+            with col_t:
+                st.markdown(f"**Longueur** : {len(texte_final):,} caractères")
 
-            # Entités extraites
-            st.markdown("**Entités extraites**")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("🏷️ **Assuré** : Jean Martin")
-                st.markdown("📅 **Date d'effet** : 01/01/2024")
-                st.markdown("💰 **Prime** : 850,00 €")
-            with col2:
-                st.markdown("🚗 **Immatriculation** : AB-123-CD")
-                st.markdown("📧 **Email** : j.martin@email.fr")
-                st.markdown("📱 **Téléphone** : 06 12 34 56 78")
+            st.success(f"✅ Traitement en **{temps_ms} ms**")
 
-            st.markdown("---")
-            st.markdown("**Intention détectée** : `souscription` (confiance 91%)")
-            st.markdown("**Topic dominant** : `contrat_assurance_auto` (82%)")
-            st.success(f"Traitement en **312 ms** | Modèle : DocumentClassifier BiLSTM v1.4.2")
+            # ── Texte brut ────────────────────────────────────────────────────
+            with st.expander("📃 Texte extrait complet"):
+                st.text_area("", value=texte_final, height=250, label_visibility="collapsed")
 
-        elif analyser:
-            st.warning("Veuillez uploader un fichier ou saisir du texte.")
-        else:
-            st.info("Uploade un document ou colle du texte pour démarrer l'analyse.")
+        elif not analyser:
+            st.info("⬅️ Uploade un fichier ou colle du texte, puis clique **Analyser**.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
