@@ -299,16 +299,50 @@ elif page == "📄 Classifier un document":
 
     # ── Fonctions NLP légères (sans spaCy) ────────────────────────────────────
 
+    # ── Fonctions NLP légères (sans spaCy) ────────────────────────────────────
+
     PATTERNS = {
-        "Montant (€)":        r'\b\d{1,3}(?:[\s]\d{3})*(?:[.,]\d{1,2})?\s*(?:€|EUR|euros?)\b',
-        "Date":               r'\b(?:\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})\b',
-        "Email":              r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
-        "Téléphone":          r'\b(?:(?:\+33|0033|0)[1-9])(?:[\s.\-]?\d{2}){4}\b',
-        "IBAN":               r'\bFR\d{2}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{2,3}\b',
-        "Immatriculation":    r'\b[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}\b',
-        "Code postal":        r'\b(?:0[1-9]|[1-8]\d|9[0-5])\d{3}\b',
-        "Numéro de contrat":  r'\b(?:N°?|Ref\.?|Contrat)[\s:]*([A-Z0-9\-]{6,20})\b',
+        "Montant (€)":     r'\b\d{1,3}(?:[\s]\d{3})*(?:[.,]\d{1,2})?\s*(?:€|EUR|euros?)\b',
+        "Date":            r'\b(?:\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})\b',
+        "Email":           r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
+        "Téléphone":       r'\b(?:(?:\+33|0033|0)[1-9])(?:[\s.\-]?\d{2}){4}\b',
+        "IBAN":            r'\bFR\d{2}(?:[\s]?\d{4}){5}(?:[\s]?\d{1,3})?\b',
+        "BIC":             r'\b[A-Z]{4}FR[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b',
+        "Immatriculation": r'\b[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}\b',
+        "Code postal":     r'\b(?:0[1-9]|[1-8]\d|9[0-5])\d{3}\b',
+        "N° compte":       r'(?:N°\s*compte|N° compte)\s*\n?\s*(\d{10,11})',
     }
+
+    def extraire_entites_rib(texte: str) -> dict:
+        """Extraction spécialisée ligne par ligne pour les RIB/IBAN."""
+        entites = {}
+        lignes = [l.strip() for l in texte.splitlines() if l.strip()]
+        for i, ligne in enumerate(lignes):
+            lu = ligne.upper()
+            # IBAN reconstruit depuis tokens après FR
+            m = re.search(r'(FR\d{2}(?:[\s]?\d+){3,})', ligne, re.IGNORECASE)
+            if m:
+                iban = re.sub(r'\s+', ' ', m.group(1)).strip()
+                if len(iban.replace(" ", "")) >= 20:
+                    entites["IBAN"] = [iban]
+            # BIC : XXXX FR XX(X)
+            m2 = re.search(r'\b([A-Z]{4}FR[A-Z0-9]{2,5})\b', ligne)
+            if m2:
+                entites["BIC"] = [m2.group(1)]
+            # Titulaire : M / MME / MR suivi d'un nom
+            if re.match(r'^(M\.?|MR\.?|MME\.?|MONSIEUR|MADAME)\s+[A-ZÉÈÀÙ]', lu):
+                if len(ligne) < 60:
+                    entites["Titulaire"] = [ligne]
+            # Banque / domiciliation
+            if any(k in lu for k in ["CCM", "CREDIT MUTUEL", "BNP", "SOCIETE GENERALE",
+                                     "CAISSE", "BANQUE", "CIC", "LCL", "BRED"]):
+                if len(ligne) < 80:
+                    entites.setdefault("Banque", []).append(ligne)
+            # Adresse du titulaire : numéro + rue
+            if re.match(r'^\d{1,4}\s+(RUE|AVENUE|BOULEVARD|IMPASSE|ALLEE|CHEMIN)', lu):
+                entites["Adresse"] = [ligne]
+        # Dédupliquer
+        return {k: list(dict.fromkeys(v)) for k, v in entites.items()}
 
     CLASSES = {
         "contrat_assurance_auto":       ["automobile", "auto", "véhicule", "immatriculation", "conducteur", "rc auto", "bonus"],
@@ -429,7 +463,14 @@ elif page == "📄 Classifier un document":
 
             with st.spinner("Classification NLP en cours..."):
                 resultat     = classifier_texte(texte_final)
-                entites      = extraire_entites(texte_final)
+                # Utiliser l'extracteur spécialisé RIB si document bancaire
+                if resultat["classe"] in ("releve_bancaire",):
+                    entites = extraire_entites_rib(texte_final)
+                    # Compléter avec regex génériques
+                    for k, v in extraire_entites(texte_final).items():
+                        entites.setdefault(k, v)
+                else:
+                    entites = extraire_entites(texte_final)
                 intention, conf_intent = detecter_intention(texte_final)
                 mots_cles    = top_mots_cles(texte_final)
 
