@@ -301,47 +301,84 @@ elif page == "📄 Classifier un document":
 
     # ── Fonctions NLP légères (sans spaCy) ────────────────────────────────────
 
+    # Patterns génériques (hors RIB)
     PATTERNS = {
-        "Montant (€)":     r'\b\d{1,3}(?:[\s]\d{3})*(?:[.,]\d{1,2})?\s*(?:€|EUR|euros?)\b',
+        "Montant (€)":     r'\b(?!0[0-9]\s)\d{2,}(?:[\s]\d{3})*[.,]\d{2}\s*(?:€|EUR|euros?)\b',
         "Date":            r'\b(?:\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})\b',
         "Email":           r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
         "Téléphone":       r'\b(?:(?:\+33|0033|0)[1-9])(?:[\s.\-]?\d{2}){4}\b',
         "IBAN":            r'\bFR\d{2}(?:[\s]?\d{4}){5}(?:[\s]?\d{1,3})?\b',
         "BIC":             r'\b[A-Z]{4}FR[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b',
         "Immatriculation": r'\b[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}\b',
-        "Code postal":     r'\b(?:0[1-9]|[1-8]\d|9[0-5])\d{3}\b',
-        "N° compte":       r'(?:N°\s*compte|N° compte)\s*\n?\s*(\d{10,11})',
+        # Code postal : exactement 5 chiffres, précédé d'un espace ou début,
+        # commençant par 0[1-9] ou [1-8]X ou 9[0-5] — exclut codes banque/guichet
+        "Code postal":     r'(?<![\d])(?:0[1-9]|[1-8]\d|9[0-5])\d{3}(?![\d])',
     }
 
+    # Mots-clés RIB dans les en-têtes à ignorer pour la banque
+    _RIB_HEADERS = {"BANQUE", "GUICHET", "N° COMPTE", "CLÉ", "DEVISE",
+                    "DOMICILIATION", "IDENTIFIANT", "NATIONAL", "INTERNATIONAL",
+                    "IBAN", "BIC", "TITULAIRE", "ACCOUNT"}
+
     def extraire_entites_rib(texte: str) -> dict:
-        """Extraction spécialisée ligne par ligne pour les RIB/IBAN."""
+        """Extraction spécialisée ligne par ligne pour les RIB."""
         entites = {}
         lignes = [l.strip() for l in texte.splitlines() if l.strip()]
+
+        # Repérer la ligne d'en-tête du tableau RIB pour l'ignorer
+        header_idx = next(
+            (i for i, l in enumerate(lignes)
+             if "Banque" in l and "Guichet" in l and "N° compte" in l),
+            -1
+        )
+        valeurs_idx = header_idx + 1 if header_idx >= 0 else -1
+
         for i, ligne in enumerate(lignes):
             lu = ligne.upper()
-            # IBAN reconstruit depuis tokens après FR
+
+            # Ignorer les lignes d'en-tête du tableau RIB
+            words = set(lu.split())
+            if words & _RIB_HEADERS and len(words) >= 3:
+                continue
+            # Ignorer la ligne des valeurs numériques brutes du tableau
+            if i == valeurs_idx:
+                continue
+
+            # IBAN : chercher FR suivi de chiffres groupés
             m = re.search(r'(FR\d{2}(?:[\s]?\d+){3,})', ligne, re.IGNORECASE)
             if m:
                 iban = re.sub(r'\s+', ' ', m.group(1)).strip()
                 if len(iban.replace(" ", "")) >= 20:
                     entites["IBAN"] = [iban]
-            # BIC : XXXX FR XX(X)
+
+            # BIC
             m2 = re.search(r'\b([A-Z]{4}FR[A-Z0-9]{2,5})\b', ligne)
             if m2:
                 entites["BIC"] = [m2.group(1)]
-            # Titulaire : M / MME / MR suivi d'un nom
+
+            # Titulaire : ligne commençant par M / MME / MR + nom
             if re.match(r'^(M\.?|MR\.?|MME\.?|MONSIEUR|MADAME)\s+[A-ZÉÈÀÙ]', lu):
-                if len(ligne) < 60:
+                if len(ligne) < 60 and "COMPTE" not in lu:
                     entites["Titulaire"] = [ligne]
-            # Banque / domiciliation
-            if any(k in lu for k in ["CCM", "CREDIT MUTUEL", "BNP", "SOCIETE GENERALE",
-                                     "CAISSE", "BANQUE", "CIC", "LCL", "BRED"]):
-                if len(ligne) < 80:
-                    entites.setdefault("Banque", []).append(ligne)
-            # Adresse du titulaire : numéro + rue
+
+            # Nom banque : ligne courte contenant un mot-clé bancaire
+            # mais PAS une ligne d'en-tête ni d'adresse longue
+            banque_kw = ["CCM ", "CREDIT MUTUEL", "BNP", "SOCIETE GENERALE",
+                         "CIC", "LCL", "BRED", "CAISSE D", "BANQUE POPULAIRE",
+                         "LA BANQUE POSTALE", "HSBC", "NATIXIS"]
+            if any(k in lu for k in banque_kw):
+                if len(ligne) < 50 and not re.search(r'\d{5}', ligne):
+                    entites["Banque"] = [ligne]
+
+            # Adresse : numéro + type de voie
             if re.match(r'^\d{1,4}\s+(RUE|AVENUE|BOULEVARD|IMPASSE|ALLEE|CHEMIN)', lu):
                 entites["Adresse"] = [ligne]
-        # Dédupliquer
+
+            # Code postal : 5 chiffres seuls sur la ligne ou en début
+            m_cp = re.search(r'(?<![\d])((?:0[1-9]|[1-8]\d|9[0-5])\d{3})(?![\d])', ligne)
+            if m_cp and len(ligne) < 30:
+                entites["Code postal"] = [m_cp.group(1)]
+
         return {k: list(dict.fromkeys(v)) for k, v in entites.items()}
 
     CLASSES = {
