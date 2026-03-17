@@ -661,9 +661,9 @@ elif page == "🔍 Analyser une souscription":
                     "axis": {"range": [0, 100]},
                     "bar": {"color": "#e85555" if score > 0.5 else "#f5a623" if score > 0.3 else "#3dd68c"},
                     "steps": [
-                        {"range": [0, 30], "color": "#3dd68c22"},
-                        {"range": [30, 50], "color": "#f5a62322"},
-                        {"range": [50, 100], "color": "#e8555522"},
+                        {"range": [0, 30],   "color": "rgba(61,214,140,0.15)"},
+                        {"range": [30, 50],  "color": "rgba(245,166,35,0.15)"},
+                        {"range": [50, 100], "color": "rgba(232,85,85,0.15)"},
                     ],
                     "threshold": {
                         "line": {"color": "white", "width": 2},
